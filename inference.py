@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, List
 
 from openai import OpenAI
 
@@ -27,11 +27,38 @@ _load_dotenv()
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
-TASK_NAME = os.getenv("MY_ENV_TASK", "easy")
+TASK_NAME = os.getenv("MY_ENV_TASK", "all")
 BENCHMARK = "ap-invoice-env"
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "ap-invoice-env:latest")
 MAX_STEPS = 25
 SUCCESS_SCORE_THRESHOLD = 0.5
+ALL_TASKS = ["easy", "medium", "hard"]
+ACTION_JSON_SCHEMA = {
+    "name": "invoice_action",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": [
+                    "list_invoices",
+                    "view_invoice",
+                    "categorize",
+                    "validate",
+                    "approve",
+                    "reject",
+                    "flag_fraud",
+                    "close",
+                ],
+            },
+            "invoice_id": {"type": ["string", "null"]},
+            "category": {"type": ["string", "null"]},
+            "notes": {"type": ["string", "null"]},
+        },
+        "required": ["type"],
+        "additionalProperties": False,
+    },
+}
 
 
 def _validate_api_config() -> None:
@@ -58,15 +85,18 @@ _validate_api_config()
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
 SYSTEM_PROMPT = """
-You are an expert accounts payable clerk. You must process every invoice correctly.
-Available actions (reply with valid JSON only):
-{
-  "type": "list_invoices" | "view_invoice" | "categorize" | "validate" | "approve" | "reject" | "flag_fraud" | "close",
-  "invoice_id": "...",
-  "category": "office_supplies | software | hardware | meals | travel | ...",
-  "notes": "..."
-}
-Goal: maximize reward and final progress score (0.0-1.0). Never approve fraud. Never loop.
+You are an expert accounts payable clerk.
+Your job is to process invoices correctly using only the available actions.
+
+Rules:
+- Return exactly one JSON object.
+- Prefer deliberate progress over repeating the same action.
+- Use the invoice data in the observation only.
+- Do not act on invoices where `processed` is already true.
+- Prefer unfinished invoices and move the workflow forward.
+- Legitimate invoices should usually be categorized, validated, and approved.
+- Suspicious invoices should be flagged for fraud or rejected when appropriate.
+- Close only when the work is complete or no further progress is possible.
 """.strip()
 
 
@@ -87,177 +117,109 @@ def _extract_message_text(message: Any) -> str:
     return str(content).strip()
 
 
+def _extract_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("No JSON object found in model response.")
+
+
+def _build_user_prompt(step: int, task_name: str, last_obs: Any, history: List[str]) -> str:
+    history_block = "\n".join(history[-6:]) if history else "None"
+    current_invoice = json.dumps(last_obs.current_invoice) if last_obs.current_invoice else "null"
+    return (
+        f"Task: {task_name}\n"
+        f"Step: {step}\n"
+        f"Last environment message: {last_obs.message}\n"
+        f"Current invoice: {current_invoice}\n"
+        f"Invoices summary: {json.dumps(last_obs.invoices_summary)}\n"
+        f"Progress: {last_obs.progress:.2f}\n"
+        f"Metadata: {json.dumps(last_obs.metadata)}\n"
+        f"Recent history:\n{history_block}\n"
+        "Important: invoices with processed=true are already finalized. "
+        "Choose an unfinished invoice unless everything is complete.\n"
+        "Return exactly one action as a JSON object that matches the schema."
+    )
+
+
 def _build_completion_kwargs(
-    step: int,
-    last_obs: Any,
-    system_prompt: Optional[str] = None,
-    user_prompt: Optional[str] = None,
+    step: int, task_name: str, last_obs: Any, history: List[str], include_response_format: bool
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": user_prompt
-                or (
-                    f"Step {step}\n"
-                    f"Last message: {last_obs.message}\n"
-                    f"Current summary: {json.dumps(last_obs.invoices_summary)}\n"
-                    f"Progress: {last_obs.progress:.2f}\n"
-                    "Return exactly one action as a JSON object matching the schema."
-                ),
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _build_user_prompt(step, task_name, last_obs, history)},
         ],
-        "temperature": 0.3,
-        "max_tokens": 80,
+        "temperature": 0.2,
+        "max_tokens": 200,
     }
+    if include_response_format:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": ACTION_JSON_SCHEMA,
+        }
     return payload
 
 
-def _infer_category(invoice: Dict[str, Any]) -> str:
-    haystack = f"{invoice.get('vendor', '')} {invoice.get('desc', '')}".lower()
-    if any(token in haystack for token in ("office", "paper", "supplies")):
-        return "office_supplies"
-    if any(token in haystack for token in ("adobe", "zoom", "software", "subscription")):
-        return "software"
-    if any(token in haystack for token in ("dell", "lenovo", "laptop", "hardware")):
-        return "hardware"
-    if any(token in haystack for token in ("starbucks", "coffee", "meal", "restaurant")):
-        return "meals"
-    if any(token in haystack for token in ("fedex", "shipping", "delivery", "logistics")):
-        return "logistics"
-    if any(token in haystack for token in ("consult", "service")):
-        return "services"
-    if any(token in haystack for token in ("meta", "ads", "marketing")):
-        return "marketing"
-    if any(token in haystack for token in ("flight", "hotel", "travel", "taxi")):
-        return "travel"
-    return "other"
-
-
-def _is_fraudulent(invoice: Dict[str, Any]) -> bool:
-    vendor = str(invoice.get("vendor", "")).lower()
-    desc = str(invoice.get("desc", "")).lower()
-    amount = float(invoice.get("amount", 0.0) or 0.0)
-    date = str(invoice.get("date", ""))
-
-    return (
-        amount <= 0
-        or amount >= 5000
-        or not date.startswith("2026-")
-        or "scam" in vendor
-        or "urgent transfer" in desc
-    )
-
-
-def _choose_target_invoice(last_obs: Any) -> Optional[Dict[str, Any]]:
-    pending = [
-        invoice
-        for invoice in last_obs.invoices_summary
-        if isinstance(invoice, dict) and not invoice.get("processed", False)
-    ]
-    if not pending:
-        return None
-    return sorted(pending, key=lambda invoice: str(invoice["id"]))[0]
-
-
-def _planned_action(last_obs: Any, stages: Dict[str, Dict[str, bool]]) -> InvoiceAction:
-    target = _choose_target_invoice(last_obs)
-    if not target:
-        return InvoiceAction(type="close")
-
-    invoice_id = str(target["id"])
-    stage = stages.setdefault(
-        invoice_id,
-        {"viewed": False, "categorized": False, "validated": False, "finalized": False},
-    )
-    current_id = None
-    if isinstance(last_obs.current_invoice, dict):
-        current_id = last_obs.current_invoice.get("id")
-
-    if current_id != invoice_id:
-        return InvoiceAction(type="view_invoice", invoice_id=invoice_id)
-    if not stage["categorized"]:
-        return InvoiceAction(
-            type="categorize",
-            invoice_id=invoice_id,
-            category=_infer_category(target),
-        )
-    if _is_fraudulent(target):
-        return InvoiceAction(type="flag_fraud", invoice_id=invoice_id)
-    if not stage["validated"]:
-        return InvoiceAction(type="validate", invoice_id=invoice_id)
-    return InvoiceAction(type="approve", invoice_id=invoice_id)
-
-
-def _request_model_strategy(task_name: str, last_obs: Any) -> None:
-    try:
-        completion = client.chat.completions.create(
-            **_build_completion_kwargs(
-                step=1,
-                last_obs=last_obs,
-                system_prompt=(
-                    "You are helping with an accounts payable benchmark. "
-                    "Briefly summarize a safe processing strategy."
-                ),
-                user_prompt=(
-                    f"Task: {task_name}\n"
-                    f"Current invoices: {json.dumps(last_obs.invoices_summary)}\n"
-                    "Reply in one short sentence."
-                ),
+def _get_model_action(step: int, task_name: str, last_obs: Any, history: List[str]) -> InvoiceAction:
+    for include_response_format in (True, False):
+        try:
+            completion = client.chat.completions.create(
+                **_build_completion_kwargs(
+                    step=step,
+                    task_name=task_name,
+                    last_obs=last_obs,
+                    history=history,
+                    include_response_format=include_response_format,
+                )
             )
-        )
-        _extract_message_text(completion.choices[0].message)
-    except Exception:
-        pass
+            raw_text = _extract_message_text(completion.choices[0].message)
+            action_dict = _extract_json_object(raw_text)
+            return InvoiceAction.model_validate(action_dict)
+        except Exception:
+            continue
+    return InvoiceAction(type="list_invoices")
 
 
-def _update_stages(stages: Dict[str, Dict[str, bool]], action: InvoiceAction, reward: float) -> None:
-    if not action.invoice_id:
-        return
-
-    stage = stages.setdefault(
-        action.invoice_id,
-        {"viewed": False, "categorized": False, "validated": False, "finalized": False},
-    )
-    if action.type == "view_invoice" and reward > 0:
-        stage["viewed"] = True
-    elif action.type == "categorize" and reward > 0:
-        stage["categorized"] = True
-    elif action.type == "validate" and reward > 0:
-        stage["validated"] = True
-    elif action.type in {"approve", "reject", "flag_fraud"} and reward != 0:
-        stage["finalized"] = True
+def _task_list() -> List[str]:
+    requested = TASK_NAME.strip().lower()
+    if requested in {"", "all", "*"}:
+        return ALL_TASKS
+    return [TASK_NAME]
 
 
-async def main() -> None:
+async def _run_task(task_name: str) -> None:
     env = await InvoiceEnv.from_docker_image(LOCAL_IMAGE_NAME)
     rewards: List[float] = []
-    stages: Dict[str, Dict[str, bool]] = {}
+    history: List[str] = []
     steps_taken = 0
     score = 0.0
     success = False
 
-    print(f"[START] task={TASK_NAME} env={BENCHMARK} model={MODEL_NAME}", flush=True)
+    print(f"[START] task={task_name} env={BENCHMARK} model={MODEL_NAME}", flush=True)
 
     try:
-        result = await env.reset(task=TASK_NAME)
+        result = await env.reset(task=task_name)
         last_obs = result.observation
-        _request_model_strategy(TASK_NAME, last_obs)
 
         for step in range(1, MAX_STEPS + 1):
             if result.done:
                 break
 
-            action = _planned_action(last_obs, stages)
-
+            action = _get_model_action(step, task_name, last_obs, history)
             result = await env.step(action)
             obs = result.observation
             reward = result.reward or 0.0
             rewards.append(reward)
             steps_taken = step
-            _update_stages(stages, action, reward)
 
             action_str = json.dumps(action.model_dump(), separators=(",", ":"))
             print(
@@ -266,6 +228,10 @@ async def main() -> None:
                 flush=True,
             )
 
+            history.append(
+                f"step={step} action={action_str} reward={reward:.2f} "
+                f"done={str(result.done).lower()} progress={obs.progress:.2f}"
+            )
             last_obs = obs
             if result.done:
                 break
@@ -280,6 +246,11 @@ async def main() -> None:
             f"score={score:.3f} rewards={rewards_str}",
             flush=True,
         )
+
+
+async def main() -> None:
+    for task_name in _task_list():
+        await _run_task(task_name)
 
 
 if __name__ == "__main__":

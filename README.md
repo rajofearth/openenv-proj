@@ -92,19 +92,14 @@ uv run openenv validate
 
 ## Baseline inference
 
-The baseline script uses the OpenAI client for a one-time model strategy call, then follows a deterministic invoice-processing workflow so scores are reproducible across runs.
+The baseline script uses the OpenAI client to let the model choose actions from the current observation. This keeps the project a benchmark for agent decision-making rather than a hand-scripted solver.
 
 ```powershell
 docker build -f server/Dockerfile -t ap-invoice-env:latest .
+python inference.py
 $env:MY_ENV_TASK="easy"; python inference.py
 $env:MY_ENV_TASK="medium"; python inference.py
 $env:MY_ENV_TASK="hard"; python inference.py
 ```
 
-## Baseline scores
-
-Using `MODEL_NAME=google/gemma-4-e2b` with `API_BASE_URL=http://127.0.0.1:1234/v1`:
-
-- `easy`: score `1.000` in 12 steps
-- `medium`: score `1.000` in 16 steps
-- `hard`: score `1.000` in 17 steps
+If `MY_ENV_TASK` is unset or set to `all`, the script runs `easy`, `medium`, and `hard` sequentially.
