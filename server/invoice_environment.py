@@ -149,6 +149,21 @@ class InvoiceEnv(Environment):
         self.max_steps = cfg["max_steps"]
         self.last_action_type = None
 
+    def _public_invoice(self, invoice_id: str, invoice: Dict[str, Any]) -> Dict[str, Any]:
+        finalized = "correct" in self.processed.get(invoice_id, {})
+        return {
+            "id": invoice_id,
+            "vendor": invoice["vendor"],
+            "amount": invoice["amount"],
+            "date": invoice["date"],
+            "desc": invoice["desc"],
+            "po": invoice["po"],
+            "processed": finalized,
+        }
+
+    def _finalized_count(self) -> int:
+        return sum(1 for processed in self.processed.values() if "correct" in processed)
+
     def reset(
         self,
         seed: int | None = None,
@@ -182,7 +197,7 @@ class InvoiceEnv(Environment):
             message = "Listed all pending invoices."
         elif action.type == "view_invoice" and invoice_id and invoice:
             reward += 0.15
-            self.current_invoice = {"id": invoice_id, **invoice}
+            self.current_invoice = self._public_invoice(invoice_id, invoice)
             message = f"Viewed {invoice_id}."
         elif action.type == "categorize" and invoice_id and invoice and action.category:
             if action.category == invoice["ground_category"]:
@@ -235,12 +250,11 @@ class InvoiceEnv(Environment):
             reward -= 0.05
             message = "Invalid or incomplete action."
 
-        correct_count = sum(
-            1 for processed in self.processed.values() if processed.get("correct", False)
-        )
+        correct_count = sum(1 for processed in self.processed.values() if processed.get("correct", False))
+        finalized_count = self._finalized_count()
         total = len(self.invoices)
         progress = correct_count / total if total else 0.0
-        done = self.step_count >= self.max_steps or len(self.processed) == total
+        done = self.step_count >= self.max_steps or finalized_count == total or action.type == "close"
 
         return self._build_obs(
             message=message,
@@ -259,7 +273,7 @@ class InvoiceEnv(Environment):
         return InvoiceObservation(
             message=message,
             invoices_summary=[
-                {"id": invoice_id, **invoice, "processed": invoice_id in self.processed}
+                self._public_invoice(invoice_id, invoice)
                 for invoice_id, invoice in self.invoices.items()
             ],
             current_invoice=self.current_invoice,
@@ -269,7 +283,7 @@ class InvoiceEnv(Environment):
             metadata={
                 "task": self.current_task,
                 "steps": self.step_count,
-                "processed": len(self.processed),
+                "processed": self._finalized_count(),
             },
         )
 

@@ -18,6 +18,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["openai>=1.35.0"]
 
+[project.scripts]
+server = "server.app:main"
+
 [dependency-groups]
 dev = ["openai>=1.35.0"]
 
