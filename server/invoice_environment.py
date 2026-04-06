@@ -149,14 +149,23 @@ class InvoiceEnv(Environment):
         self.max_steps = cfg["max_steps"]
         self.last_action_type = None
 
-    async def reset(self, task: str = "easy") -> InvoiceObservation:
+    def reset(
+        self,
+        seed: int | None = None,
+        episode_id: str | None = None,
+        task: str = "easy",
+    ) -> InvoiceObservation:
         self._load_task(task)
         return self._build_obs(
             f"Inbox loaded with {len(self.invoices)} invoices.",
             progress=0.0,
         )
 
-    async def step(self, action: InvoiceAction) -> InvoiceObservation:
+    def step(
+        self,
+        action: InvoiceAction,
+        timeout_s: float | None = None,
+    ) -> InvoiceObservation:
         self.step_count += 1
         reward = 0.0
         message = ""
@@ -264,5 +273,6 @@ class InvoiceEnv(Environment):
             },
         )
 
+    @property
     def state(self) -> Dict[str, Any]:
         return {"task": self.current_task, "step_count": self.step_count}
