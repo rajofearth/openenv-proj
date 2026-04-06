@@ -1,0 +1,12 @@
+name: ap-invoice-env
+version: "1.0.0"
+description: Real-world Accounts Payable Invoice Processor. Triage, validate, categorize, detect fraud, and approve invoices.
+emoji: "📄"
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8000
+tags:
+  - openenv
+  - finance
+  - automation
