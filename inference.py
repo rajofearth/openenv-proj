@@ -86,8 +86,10 @@ Rules:
 def _load_config() -> InferenceConfig:
     _load_dotenv()
     api_base_url = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-    model_name = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-    api_key = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+    model_name = os.getenv("MODEL_NAME", "meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    api_key = (
+        os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+    )
     task_name = os.getenv("MY_ENV_TASK", "all")
     local_image_name = os.getenv("LOCAL_IMAGE_NAME", "ap-invoice-env:latest")
     env_connect_timeout_s = float(os.getenv("ENV_CONNECT_TIMEOUT_S", "15"))
@@ -99,7 +101,9 @@ def _load_config() -> InferenceConfig:
             "Missing API token. Set HF_TOKEN, OPENAI_API_KEY, or API_KEY before running inference.py."
         )
 
-    if "router.huggingface.co" in api_base_url.lower() and not api_key.startswith("hf_"):
+    if "router.huggingface.co" in api_base_url.lower() and not api_key.startswith(
+        "hf_"
+    ):
         token_prefix = api_key.split("_", 1)[0] if "_" in api_key else api_key[:4]
         raise RuntimeError(
             "HF router authentication is misconfigured: "
@@ -148,7 +152,9 @@ def format_step_line(
     )
 
 
-def format_end_line(success: bool, steps: int, score: float, rewards: List[float]) -> str:
+def format_end_line(
+    success: bool, steps: int, score: float, rewards: List[float]
+) -> str:
     rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
     return (
         f"[END] success={str(success).lower()} steps={steps} "
@@ -201,7 +207,11 @@ def _build_user_prompt(
     observation: InvoiceObservation,
     history: List[str],
 ) -> str:
-    current_invoice = json.dumps(observation.current_invoice) if observation.current_invoice else "null"
+    current_invoice = (
+        json.dumps(observation.current_invoice)
+        if observation.current_invoice
+        else "null"
+    )
     history_block = "\n".join(history[-8:]) if history else "None"
     return (
         f"Task: {task_name}\n"
@@ -256,7 +266,9 @@ def _build_completion_kwargs(
 
 def _fallback_action(observation: InvoiceObservation) -> InvoiceAction:
     if observation.current_invoice and not observation.current_invoice.get("processed"):
-        return InvoiceAction(type="validate", invoice_id=observation.current_invoice["id"])
+        return InvoiceAction(
+            type="validate", invoice_id=observation.current_invoice["id"]
+        )
     return InvoiceAction(type="list_invoices")
 
 
@@ -307,7 +319,12 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
     score = 0.0
     success = False
 
-    print(format_start_line(task=task_name, env=config.benchmark, model=config.model_name), flush=True)
+    print(
+        format_start_line(
+            task=task_name, env=config.benchmark, model=config.model_name
+        ),
+        flush=True,
+    )
 
     try:
         result = await env.reset(task=task_name)
@@ -365,7 +382,12 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
         success = score >= config.success_score_threshold
     finally:
         await env.close()
-        print(format_end_line(success=success, steps=steps_taken, score=score, rewards=rewards), flush=True)
+        print(
+            format_end_line(
+                success=success, steps=steps_taken, score=score, rewards=rewards
+            ),
+            flush=True,
+        )
 
 
 async def _open_env(config: InferenceConfig) -> InvoiceEnv:
@@ -440,7 +462,9 @@ def _is_transient_env_error(exc: Exception) -> bool:
     )
 
 
-async def _run_task_with_retries(config: InferenceConfig, client: OpenAI, task_name: str) -> None:
+async def _run_task_with_retries(
+    config: InferenceConfig, client: OpenAI, task_name: str
+) -> None:
     attempts = max(1, config.task_retries + 1)
     for attempt in range(1, attempts + 1):
         try:
