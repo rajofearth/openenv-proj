@@ -1,3 +1,11 @@
+---
+title: ap-invoice-env
+emoji: 📄
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8000
+---
 # ap-invoice-env
 
 Real-world Accounts Payable Invoice Processor built as an OpenEnv environment with three graded tasks: `easy`, `medium`, and `hard`.
