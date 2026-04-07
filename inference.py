@@ -1,10 +1,12 @@
 import asyncio
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, List
 
 from openai import OpenAI
+from websockets import exceptions as websocket_exceptions
 
 from client import InvoiceEnv
 from models import InvoiceAction, InvoiceObservation
@@ -33,6 +35,9 @@ class InferenceConfig:
     local_image_name: str
     max_steps: int
     success_score_threshold: float
+    env_connect_timeout_s: float
+    env_message_timeout_s: float
+    task_retries: int
 
 
 ACTION_JSON_SCHEMA = {
@@ -85,6 +90,9 @@ def _load_config() -> InferenceConfig:
     api_key = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
     task_name = os.getenv("MY_ENV_TASK", "all")
     local_image_name = os.getenv("LOCAL_IMAGE_NAME", "ap-invoice-env:latest")
+    env_connect_timeout_s = float(os.getenv("ENV_CONNECT_TIMEOUT_S", "15"))
+    env_message_timeout_s = float(os.getenv("ENV_MESSAGE_TIMEOUT_S", "180"))
+    task_retries = int(os.getenv("TASK_RETRIES", "2"))
 
     if not api_key:
         raise RuntimeError(
@@ -111,6 +119,9 @@ def _load_config() -> InferenceConfig:
         local_image_name=local_image_name,
         max_steps=25,
         success_score_threshold=0.65,
+        env_connect_timeout_s=env_connect_timeout_s,
+        env_message_timeout_s=env_message_timeout_s,
+        task_retries=task_retries,
     )
 
 
@@ -129,7 +140,7 @@ def format_step_line(
     done: bool,
     error: str | None,
 ) -> str:
-    action_str = json.dumps(action.model_dump(exclude_none=True), separators=(",", ":"))
+    action_str = _format_action(action)
     error_str = _single_line(error) if error else "null"
     return (
         f"[STEP] step={step} action={action_str} reward={reward:.2f} "
@@ -143,6 +154,14 @@ def format_end_line(success: bool, steps: int, score: float, rewards: List[float
         f"[END] success={str(success).lower()} steps={steps} "
         f"score={score:.2f} rewards={rewards_str}"
     )
+
+
+def _format_action(action: InvoiceAction) -> str:
+    if action.type == "categorize":
+        return f"categorize({action.invoice_id},{action.category})"
+    if action.invoice_id:
+        return f"{action.type}({action.invoice_id})"
+    return action.type
 
 
 def _extract_message_text(message: Any) -> str:
@@ -280,9 +299,10 @@ def _task_list(task_name: str) -> List[str]:
 
 
 async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> None:
-    env = await InvoiceEnv.from_docker_image(config.local_image_name)
+    env = await _open_env(config)
     rewards: List[float] = []
     history: List[str] = []
+    action_history: List[InvoiceAction] = []
     steps_taken = 0
     score = 0.0
     success = False
@@ -305,10 +325,17 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
                 observation=observation,
                 history=history,
             )
-            result = await env.step(action)
+            result, env = await _step_with_recovery(
+                config=config,
+                env=env,
+                task_name=task_name,
+                action_history=action_history,
+                action=action,
+            )
             observation = result.observation
             reward = result.reward or 0.0
             rewards.append(reward)
+            action_history.append(action)
             steps_taken = step
 
             print(
@@ -341,11 +368,101 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
         print(format_end_line(success=success, steps=steps_taken, score=score, rewards=rewards), flush=True)
 
 
+async def _open_env(config: InferenceConfig) -> InvoiceEnv:
+    return await InvoiceEnv.from_docker_image_with_timeouts(
+        config.local_image_name,
+        connect_timeout_s=config.env_connect_timeout_s,
+        message_timeout_s=config.env_message_timeout_s,
+    )
+
+
+async def _rebuild_env(
+    config: InferenceConfig,
+    task_name: str,
+    action_history: List[InvoiceAction],
+) -> InvoiceEnv:
+    env = await _open_env(config)
+    await env.reset(task=task_name)
+    for prior_action in action_history:
+        await env.step(prior_action)
+    return env
+
+
+async def _step_with_recovery(
+    config: InferenceConfig,
+    env: InvoiceEnv,
+    task_name: str,
+    action_history: List[InvoiceAction],
+    action: InvoiceAction,
+) -> tuple[Any, InvoiceEnv]:
+    attempts = max(1, config.task_retries + 1)
+    current_env = env
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await current_env.step(action), current_env
+        except Exception as exc:
+            if not _is_transient_env_error(exc) or attempt >= attempts:
+                raise
+
+            print(
+                f"Recovering task {task_name}: reconnecting after websocket error while handling "
+                f"{_format_action(action)} ({attempt}/{attempts}). Reason: {_single_line(exc)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            try:
+                await current_env.close()
+            except Exception:
+                pass
+
+            await asyncio.sleep(min(attempt, 3))
+            current_env = await _rebuild_env(
+                config=config,
+                task_name=task_name,
+                action_history=action_history,
+            )
+
+    raise RuntimeError("Unreachable recovery flow")
+
+
+def _is_transient_env_error(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            ConnectionError,
+            ConnectionAbortedError,
+            OSError,
+            websocket_exceptions.WebSocketException,
+        ),
+    )
+
+
+async def _run_task_with_retries(config: InferenceConfig, client: OpenAI, task_name: str) -> None:
+    attempts = max(1, config.task_retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            await _run_task(config, client, task_name)
+            return
+        except Exception as exc:
+            if not _is_transient_env_error(exc) or attempt >= attempts:
+                raise
+            print(
+                f"Retrying task {task_name} from recovered state ({attempt}/{attempts}). "
+                f"Reason: {_single_line(exc)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            await asyncio.sleep(min(attempt, 3))
+
+
 async def main() -> None:
     config = _load_config()
     client = OpenAI(base_url=config.api_base_url, api_key=config.api_key)
     for task_name in _task_list(config.task_name):
-        await _run_task(config, client, task_name)
+        await _run_task_with_retries(config, client, task_name)
 
 
 if __name__ == "__main__":

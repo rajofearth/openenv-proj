@@ -125,7 +125,7 @@ The baseline script uses the OpenAI client to request a short per-task review pl
 
 ```powershell
 docker build -t ap-invoice-env:latest .
-python inference.py
+python inference.py # to run all of the tasks
 $env:MY_ENV_TASK="easy"; python inference.py
 $env:MY_ENV_TASK="medium"; python inference.py
 $env:MY_ENV_TASK="hard"; python inference.py
@@ -135,12 +135,27 @@ If `MY_ENV_TASK` is unset or set to `all`, the script runs `easy`, `medium`, and
 
 ### Baseline Scores
 
-Measured locally on April 7, 2026 with `MODEL_NAME=qwen3.5-4b`:
+Measured locally on April 7, 2026 with:
 
+`MODEL_NAME=qwen3.5-4b`
 | Task | Steps | Score |
 |---|---:|---:|
 | easy | 12 | 1.00 |
 | medium | 16 | 1.00 |
 | hard | 20 | 1.00 |
+
+`MODEL_NAME=google/gemma-4-e4b`
+| Task | Steps | Score |
+|---|---:|---:|
+| easy | 12 | 1.00 |
+| medium | 16 | 1.00 |
+| hard | 20 | 1.00 |
+
+`MODEL_NAME=meta-llama/llama-4-scout-17b-16e-instruct`
+| Task | Steps | Score |
+|---|---:|---:|
+| easy | 18 | 1.00 |
+| medium | 18 | 1.00 |
+| hard | 25 | 0.95 |
 
 These values were produced by the current `inference.py` using the local Docker image `ap-invoice-env:latest`.
