@@ -144,12 +144,20 @@ Measured locally on April 7, 2026 with:
 | medium | 16 | 1.00 |
 | hard | 20 | 1.00 |
 
+
+`MODEL_NAME=gemma-4-31b-it`
+| Task | Steps | Score |
+|---|---:|---:|
+| easy | 12 | 1.00 |
+| medium | 20 | 1.00 |
+| hard | 25 | 0.75 |
+
 `MODEL_NAME=google/gemma-4-e4b`
 | Task | Steps | Score |
 |---|---:|---:|
 | easy | 12 | 1.00 |
-| medium | 16 | 1.00 |
-| hard | 20 | 1.00 |
+| medium | 17 | 1.00 |
+| hard | 23 | 0.40 |
 
 `MODEL_NAME=meta-llama/llama-4-scout-17b-16e-instruct`
 | Task | Steps | Score |
@@ -158,4 +166,26 @@ Measured locally on April 7, 2026 with:
 | medium | 18 | 1.00 |
 | hard | 25 | 0.95 |
 
-These values were produced by the current `inference.py` using the local Docker image `ap-invoice-env:latest`.
+`MODEL_NAME=gemini-3.1-flash-lite-preview`
+| Task | Steps | Score |
+|---|---:|---:|
+| easy | 12 | 1.00 |
+| medium | 17 | 0.88 |
+| hard | 25 | 0.55 |
+
+### Model benchmark results
+
+| Model | Easy | Medium | Hard | Avg score |
+|---|:-:|:-:|:-:|:-:|
+| `gemma-4-31b-it` | ✅ 12s | ✅ 20s | 🟡 25s · 0.75 | **0.92** |
+| `google/gemma-4-e4b` | ✅ 12s | ✅ 17s | 🔴 23s · 0.40 | **0.80** |
+| `meta-llama/llama-4-scout-17b-16e-instruct` | ✅ 18s | ✅ 18s | 🟢 25s · 0.95 | **0.98** |
+| `gemini-3.1-flash-lite-preview` | ✅ 12s | 🟡 17s · 0.88 | 🔴 25s · 0.55 | **0.81** |
+
+*Steps shown only where score < 1.00 · ✅ = perfect score · 🟢 ≥ 0.90 · 🟡 ≥ 0.75 · 🔴 < 0.75*
+
+![Sample invoice](image.png)
+
+These values were produced by the current `inference.py` using the local Docker image `ap-invoice-env:latest`. 
+> NOTE:
+Based on our tests, most free open-source “non-thinking” models available on Hugging Face for free inference failed to complete the tasks. Small “thinking” models often get caught in dead loops and generally only complete the easy task while failing the others. Models with reasoning capability and parameter counts above roughly 4B performed most stably and produced the decent scores reported above.

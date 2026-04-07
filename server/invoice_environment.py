@@ -1,10 +1,9 @@
 from copy import deepcopy
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from openenv.core.env_server import Environment
 
 from models import InvoiceAction, InvoiceObservation
-
 
 VALID_CATEGORIES = [
     "office_supplies",
@@ -132,7 +131,9 @@ class InvoiceEnv(Environment):
                         "currency": "USD",
                         "requester": "Workplace",
                         "bank_change_requested": False,
-                        "validation_issues": ["missing_purchase_order_for_high_value_invoice"],
+                        "validation_issues": [
+                            "missing_purchase_order_for_high_value_invoice"
+                        ],
                         "expected_outcome": "reject",
                     },
                 },
@@ -165,7 +166,10 @@ class InvoiceEnv(Environment):
                         "currency": "USD",
                         "requester": "Finance Ops",
                         "bank_change_requested": True,
-                        "validation_issues": ["unexpected_bank_change_request", "high_value_without_purchase_order"],
+                        "validation_issues": [
+                            "unexpected_bank_change_request",
+                            "high_value_without_purchase_order",
+                        ],
                         "expected_outcome": "flag_fraud",
                     },
                     "INV010": {
@@ -260,18 +264,26 @@ class InvoiceEnv(Environment):
         total = len(self.invoices)
         if total == 0:
             return 0.0
-        return sum(self._invoice_score(invoice_id) for invoice_id in self.invoices) / total
+        return (
+            sum(self._invoice_score(invoice_id) for invoice_id in self.invoices) / total
+        )
 
     def _finalized_count(self) -> int:
         return sum(1 for invoice_id in self.invoices if self._is_finalized(invoice_id))
 
     def _correctly_finalized_count(self) -> int:
-        return sum(1 for processed in self.processed.values() if processed.get("correct") is True)
+        return sum(
+            1
+            for processed in self.processed.values()
+            if processed.get("correct") is True
+        )
 
     def _action_signature(self, action: InvoiceAction) -> tuple[Any, ...]:
         return (action.type, action.invoice_id, action.category, action.notes)
 
-    def _public_invoice(self, invoice_id: str, invoice: Dict[str, Any]) -> Dict[str, Any]:
+    def _public_invoice(
+        self, invoice_id: str, invoice: Dict[str, Any]
+    ) -> Dict[str, Any]:
         status = self._status_for(invoice_id)
         return {
             "id": invoice_id,
@@ -398,7 +410,11 @@ class InvoiceEnv(Environment):
                     reward += 0.15
                     message = f"Validation passed for {invoice_id}."
             self._refresh_current_invoice(invoice_id)
-        elif action.type in {"approve", "reject", "flag_fraud"} and invoice_id and invoice:
+        elif (
+            action.type in {"approve", "reject", "flag_fraud"}
+            and invoice_id
+            and invoice
+        ):
             status = self._status_for(invoice_id)
             if not status["viewed"]:
                 reward -= 0.15
@@ -406,7 +422,9 @@ class InvoiceEnv(Environment):
                 message = error
             elif not status["validated"]:
                 reward -= 0.12
-                error = f"Invoice {invoice_id} must be validated before final disposition."
+                error = (
+                    f"Invoice {invoice_id} must be validated before final disposition."
+                )
                 message = error
             else:
                 status["resolution"] = action.type
@@ -426,7 +444,9 @@ class InvoiceEnv(Environment):
             remaining = len(self.invoices) - self._finalized_count()
             if remaining > 0:
                 reward -= 0.25
-                error = f"Episode closed early with {remaining} invoices still unresolved."
+                error = (
+                    f"Episode closed early with {remaining} invoices still unresolved."
+                )
                 message = error
             else:
                 reward += 0.00
