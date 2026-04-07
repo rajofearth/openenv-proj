@@ -41,6 +41,14 @@ class InvoiceEnvironmentTests(unittest.TestCase):
 
         self.assertAlmostEqual(result.progress, 0.5, places=2)
 
+    def test_final_disposition_requires_validation(self) -> None:
+        self.env.step(InvoiceAction(type="view_invoice", invoice_id="INV001"))
+        result = self.env.step(InvoiceAction(type="approve", invoice_id="INV001"))
+
+        self.assertLess(result.reward, 0.0)
+        self.assertIn("must be validated", result.message)
+        self.assertEqual(result.progress, 0.0)
+
     def test_state_is_meaningful(self) -> None:
         self.env.step(InvoiceAction(type="view_invoice", invoice_id="INV001"))
         state = self.env.state

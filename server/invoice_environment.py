@@ -400,24 +400,27 @@ class InvoiceEnv(Environment):
             self._refresh_current_invoice(invoice_id)
         elif action.type in {"approve", "reject", "flag_fraud"} and invoice_id and invoice:
             status = self._status_for(invoice_id)
-            status["resolution"] = action.type
-            status["correct"] = action.type == invoice["expected_outcome"]
-            if status["correct"]:
-                reward += 0.35 if status["validated"] else 0.20
-                if not status["validated"]:
-                    message = (
-                        f"{action.type.replace('_', ' ').title()} for {invoice_id} is correct, "
-                        "but validation was skipped."
-                    )
-                else:
-                    message = f"Correctly finalized {invoice_id} with {action.type}."
-            else:
-                reward -= 0.35
-                error = (
-                    f"Wrong final disposition for {invoice_id}. Expected "
-                    f"{invoice['expected_outcome']}."
-                )
+            if not status["viewed"]:
+                reward -= 0.15
+                error = f"Invoice {invoice_id} must be opened before final disposition."
                 message = error
+            elif not status["validated"]:
+                reward -= 0.12
+                error = f"Invoice {invoice_id} must be validated before final disposition."
+                message = error
+            else:
+                status["resolution"] = action.type
+                status["correct"] = action.type == invoice["expected_outcome"]
+                if status["correct"]:
+                    reward += 0.35
+                    message = f"Correctly finalized {invoice_id} with {action.type}."
+                else:
+                    reward -= 0.35
+                    error = (
+                        f"Wrong final disposition for {invoice_id}. Expected "
+                        f"{invoice['expected_outcome']}."
+                    )
+                    message = error
             self._refresh_current_invoice(invoice_id)
         elif action.type == "close":
             remaining = len(self.invoices) - self._finalized_count()

@@ -1,9 +1,8 @@
 import asyncio
 import json
 import os
-import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, List
 
 from openai import OpenAI
 
@@ -36,13 +35,46 @@ class InferenceConfig:
     success_score_threshold: float
 
 
+ACTION_JSON_SCHEMA = {
+    "name": "invoice_action",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": [
+                    "list_invoices",
+                    "view_invoice",
+                    "categorize",
+                    "validate",
+                    "approve",
+                    "reject",
+                    "flag_fraud",
+                    "close",
+                ],
+            },
+            "invoice_id": {"type": ["string", "null"]},
+            "category": {"type": ["string", "null"]},
+            "notes": {"type": ["string", "null"]},
+        },
+        "required": ["type"],
+        "additionalProperties": False,
+    },
+}
 ALL_TASKS = ["easy", "medium", "hard"]
 
 SYSTEM_PROMPT = """
-You are an expert accounts payable clerk.
-You are helping produce a benchmark baseline plan for the current AP inbox.
-Use the valid categories and policy rules in the observation.
-Reply with short, practical guidance only.
+You are an expert accounts payable clerk operating an invoice review environment.
+
+Rules:
+- Return exactly one JSON object that matches the action schema.
+- Use only the information provided in the observation.
+- The only valid categories are the values in `valid_categories`.
+- Prefer unfinished invoices and complete a realistic workflow: inspect, categorize, validate, then finalize.
+- Use `flag_fraud` only for suspicious payment behavior, not ordinary policy violations.
+- Use `reject` for invalid invoices or policy failures.
+- Use `approve` only when the invoice is legitimate and passes review.
+- Avoid repeating the exact same action unless the environment feedback suggests it.
 """.strip()
 
 
@@ -83,8 +115,7 @@ def _load_config() -> InferenceConfig:
 
 
 def _single_line(value: Any) -> str:
-    text = str(value)
-    return " ".join(text.split())
+    return " ".join(str(value).split())
 
 
 def format_start_line(task: str, env: str, model: str) -> str:
@@ -131,118 +162,114 @@ def _extract_message_text(message: Any) -> str:
     return str(content).strip()
 
 
-def _build_user_prompt(task_name: str, observation: InvoiceObservation) -> str:
+def _extract_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("No JSON object found in model response.")
+
+
+def _build_user_prompt(
+    step: int,
+    task_name: str,
+    observation: InvoiceObservation,
+    history: List[str],
+) -> str:
     current_invoice = json.dumps(observation.current_invoice) if observation.current_invoice else "null"
+    history_block = "\n".join(history[-8:]) if history else "None"
     return (
         f"Task: {task_name}\n"
+        f"Step: {step}\n"
         f"Objective: {observation.metadata.get('objective', '')}\n"
         f"Difficulty notes: {observation.metadata.get('difficulty_notes', '')}\n"
         f"Last environment message: {_single_line(observation.message)}\n"
+        f"Last action error: {_single_line(observation.last_action_error or 'null')}\n"
         f"Current invoice: {current_invoice}\n"
         f"Valid categories: {json.dumps(observation.valid_categories)}\n"
         f"Policy rules: {json.dumps(observation.policy_rules)}\n"
         f"Invoices summary: {json.dumps(observation.invoices_summary)}\n"
-        "Give a concise review plan for processing this inbox safely."
+        f"Progress: {observation.progress:.2f}\n"
+        f"Metadata: {json.dumps(observation.metadata)}\n"
+        f"Recent history:\n{history_block}\n"
+        "Return exactly one action as a JSON object."
     )
 
 
 def _build_completion_kwargs(
     config: InferenceConfig,
+    step: int,
     task_name: str,
     observation: InvoiceObservation,
+    history: List[str],
+    include_response_format: bool,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model": config.model_name,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(task_name, observation)},
+            {
+                "role": "user",
+                "content": _build_user_prompt(
+                    step=step,
+                    task_name=task_name,
+                    observation=observation,
+                    history=history,
+                ),
+            },
         ],
         "temperature": 0.2,
-        "max_tokens": 120,
+        "max_tokens": 180,
     }
+    if include_response_format:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": ACTION_JSON_SCHEMA,
+        }
+    return payload
 
 
-def _request_task_plan(
+def _fallback_action(observation: InvoiceObservation) -> InvoiceAction:
+    if observation.current_invoice and not observation.current_invoice.get("processed"):
+        return InvoiceAction(type="validate", invoice_id=observation.current_invoice["id"])
+    return InvoiceAction(type="list_invoices")
+
+
+def _get_model_action(
     client: OpenAI,
     config: InferenceConfig,
+    step: int,
     task_name: str,
     observation: InvoiceObservation,
-) -> str:
-    try:
-        completion = client.chat.completions.create(
-            **_build_completion_kwargs(
-                config=config,
-                task_name=task_name,
-                observation=observation,
-            )
-        )
-        return _extract_message_text(completion.choices[0].message)
-    except Exception:
-        return ""
-
-
-def _infer_category(invoice: Dict[str, Any]) -> str:
-    vendor = str(invoice.get("vendor", "")).lower()
-    desc = str(invoice.get("desc", "")).lower()
-    requester = str(invoice.get("requester", "")).lower()
-
-    if "desk" in desc or "chair" in desc or "workplace" in requester:
-        return "facilities"
-    if "meta" in vendor or "campaign" in desc or "ads" in desc:
-        return "marketing"
-    if "fedex" in vendor or "shipping" in desc:
-        return "logistics"
-    if "dell" in vendor or "hardware" in vendor or "laptop" in desc:
-        return "hardware"
-    if "adobe" in vendor or "zoom" in vendor or "subscription" in desc or "license" in desc:
-        return "software"
-    if "starbucks" in vendor or "coffee" in desc or "meal" in desc:
-        return "meals"
-
-    if "office" in vendor or "paper" in desc:
-        return "office_supplies"
-    return "services"
-
-
-def _expected_resolution(invoice: Dict[str, Any]) -> str:
-    desc = str(invoice.get("desc", "")).lower()
-    amount = float(invoice.get("amount", 0.0))
-    date = str(invoice.get("date", ""))
-
-    if invoice.get("bank_change_requested") or "wire" in desc:
-        return "flag_fraud"
-    if amount > 500 and not invoice.get("po"):
-        return "reject"
-    if amount <= 0:
-        return "reject"
-    if not date.startswith("2026"):
-        return "reject"
-    return "approve"
-
-
-def _choose_next_action(
-    observation: InvoiceObservation,
-    viewed_ids: set[str],
+    history: List[str],
 ) -> InvoiceAction:
-    unresolved = [invoice for invoice in observation.invoices_summary if not invoice.get("processed")]
-    if not unresolved:
-        return InvoiceAction(type="close")
+    errors: List[str] = []
+    for include_response_format in (True, False):
+        try:
+            completion = client.chat.completions.create(
+                **_build_completion_kwargs(
+                    config=config,
+                    step=step,
+                    task_name=task_name,
+                    observation=observation,
+                    history=history,
+                    include_response_format=include_response_format,
+                )
+            )
+            raw_text = _extract_message_text(completion.choices[0].message)
+            action_dict = _extract_json_object(raw_text)
+            return InvoiceAction.model_validate(action_dict)
+        except Exception as exc:
+            errors.append(_single_line(exc))
 
-    target = unresolved[0]
-    invoice_id = target["id"]
-
-    if invoice_id not in viewed_ids:
-        viewed_ids.add(invoice_id)
-        return InvoiceAction(type="view_invoice", invoice_id=invoice_id)
-    if not target.get("category_locked_in"):
-        return InvoiceAction(
-            type="categorize",
-            invoice_id=invoice_id,
-            category=_infer_category(target),
-        )
-    if not target.get("validated"):
-        return InvoiceAction(type="validate", invoice_id=invoice_id)
-    return InvoiceAction(type=_expected_resolution(target), invoice_id=invoice_id)
+    history.append("model_error=" + " | ".join(errors))
+    return _fallback_action(observation)
 
 
 def _task_list(task_name: str) -> List[str]:
@@ -256,7 +283,6 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
     env = await InvoiceEnv.from_docker_image(config.local_image_name)
     rewards: List[float] = []
     history: List[str] = []
-    viewed_ids: set[str] = set()
     steps_taken = 0
     score = 0.0
     success = False
@@ -265,18 +291,22 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
 
     try:
         result = await env.reset(task=task_name)
-        last_obs = result.observation
-        plan_text = _request_task_plan(client, config, task_name, last_obs)
-        if plan_text:
-            history.append("task_plan=" + _single_line(plan_text))
+        observation = result.observation
 
         for step in range(1, config.max_steps + 1):
             if result.done:
                 break
 
-            action = _choose_next_action(last_obs, viewed_ids)
+            action = _get_model_action(
+                client=client,
+                config=config,
+                step=step,
+                task_name=task_name,
+                observation=observation,
+                history=history,
+            )
             result = await env.step(action)
-            obs = result.observation
+            observation = result.observation
             reward = result.reward or 0.0
             rewards.append(reward)
             steps_taken = step
@@ -287,7 +317,7 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
                     action=action,
                     reward=reward,
                     done=result.done,
-                    error=obs.last_action_error,
+                    error=observation.last_action_error,
                 ),
                 flush=True,
             )
@@ -296,20 +326,18 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
                 _single_line(
                     f"step={step} action={action.model_dump(exclude_none=True)} "
                     f"reward={reward:.2f} done={str(result.done).lower()} "
-                    f"progress={obs.progress:.2f} error={obs.last_action_error or 'null'}"
+                    f"progress={observation.progress:.2f} "
+                    f"error={observation.last_action_error or 'null'}"
                 )
             )
-            last_obs = obs
+
             if result.done:
                 break
 
-        score = min(max(last_obs.progress, 0.0), 1.0)
+        score = min(max(observation.progress, 0.0), 1.0)
         success = score >= config.success_score_threshold
     finally:
-        try:
-            await env.close()
-        except Exception as exc:
-            print(f"env.close() cleanup error: {_single_line(exc)}", file=sys.stderr, flush=True)
+        await env.close()
         print(format_end_line(success=success, steps=steps_taken, score=score, rewards=rewards), flush=True)
 
 
