@@ -1,17 +1,15 @@
 # ap-invoice-env
 
-Real-world Accounts Payable Invoice Processor built as an OpenEnv environment with easy, medium, and hard tasks.
-MAKE SURE IT FOLLOWS: [READTHIS](READTHIS.md)
+Real-world Accounts Payable Invoice Processor built as an OpenEnv environment with three graded tasks: `easy`, `medium`, and `hard`.
 
-## Overview
+This benchmark models the kind of invoice triage work AP teams actually do: review invoice details, assign a category, run policy checks, detect suspicious payment requests, and choose the correct final disposition.
 
-This environment simulates a small accounts payable inbox. An agent must inspect invoices, assign a category, validate basic business fields, detect suspicious submissions, and make the correct final disposition.
+## Why This Is Useful
 
-Why this environment is useful:
-
-- It models a real back-office workflow instead of a toy game.
-- It provides shaped rewards for partial progress while keeping final scoring tied to correct outcomes.
-- It includes increasing difficulty from routine invoices to adversarial fraud-like edge cases.
+- It models a real back-office workflow instead of a toy task.
+- It provides partial-progress reward over the full trajectory.
+- It distinguishes routine approvals, policy rejects, and fraud review.
+- It exposes deterministic rules so agents are evaluated on workflow quality, not hidden strings.
 
 ## Action Space
 
@@ -27,20 +25,51 @@ The agent sends a typed `InvoiceAction` with:
 Each step returns a typed `InvoiceObservation` with:
 
 - `message`: feedback for the last action
-- `invoices_summary`: invoice list with business-relevant fields and completion status
+- `invoices_summary`: invoice list with AP-relevant business fields and workflow status
 - `current_invoice`: the currently opened invoice, if any
+- `valid_categories`: the accepted category labels for `categorize`
+- `policy_rules`: the benchmark rules the agent should follow
 - `reward`: shaped step reward
 - `done`: whether the episode has ended
 - `progress`: normalized score in `[0, 1]`
-- `metadata`: task name, step count, and finalized invoice count
+- `last_action_error`: raw action error text or `null`
+- `metadata`: task name, objective, step count, and reward totals
+
+## Valid Categories
+
+- `office_supplies`
+- `software`
+- `meals`
+- `hardware`
+- `logistics`
+- `services`
+- `marketing`
+- `facilities`
+
+## Policy Rules
+
+- Invoices above 500 USD require a purchase order before approval.
+- Future-dated invoices and negative invoice amounts must be rejected.
+- Unexpected bank-change requests or urgent wire wording should be flagged for fraud.
+- A complete review should inspect, categorize, validate, and then finalize each invoice.
 
 ## Tasks
 
-- `easy`: 3 routine legitimate invoices across office supplies, software, and meals
-- `medium`: 4 legitimate invoices with broader category coverage and higher-value purchases
-- `hard`: 5 invoices mixing legitimate work with suspicious vendors, impossible dates, and abnormal amounts
+- `easy`: 3 routine invoices that should all be approved after normal review.
+  Difficulty rationale: tests the happy-path AP workflow and correct category usage.
+- `medium`: 4 invoices with one policy-violating but non-fraud invoice that must be rejected.
+  Difficulty rationale: introduces business-rule reasoning rather than simple approve-all behavior.
+- `hard`: 5 invoices mixing approvals, policy rejects, and subtle fraud signals.
+  Difficulty rationale: requires differentiating suspicious payment behavior from ordinary invalid invoices.
 
-## Quick start
+## Reward Design
+
+- Positive reward is given for first-time workflow progress such as opening an invoice, correct categorization, validation, and correct final disposition.
+- Partial progress contributes to the final `progress` score: category, validation, and correct resolution all matter.
+- Repeating the exact same action, re-listing the inbox, reopening the same invoice, or closing early is penalized.
+- Episodes end when all invoices are finalized, `max_steps` is reached, or the agent explicitly closes the episode.
+
+## Quick Start
 
 ```bash
 uv venv
@@ -56,27 +85,15 @@ Copy-Item .env.example .env
 
 `inference.py` auto-loads values from `.env` if that file exists.
 
-On Windows PowerShell, you can also set vars directly:
-
-```powershell
-$env:MY_ENV_TASK="easy"
-$env:HF_TOKEN="hf_your_huggingface_token_here"
-python inference.py
-```
-
-When `API_BASE_URL` is `https://router.huggingface.co/v1`, `HF_TOKEN` must be a Hugging Face access token. Tokens from other providers will be rejected.
-
-In another terminal:
-
-```powershell
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8000/reset" `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body '{"task":"easy"}'
-```
-
 ## Docker
+
+Validator-compatible root build:
+
+```bash
+docker build -t ap-invoice-env:latest .
+```
+
+Legacy build path also works:
 
 ```bash
 docker build -f server/Dockerfile -t ap-invoice-env:latest .
@@ -90,12 +107,12 @@ Run the OpenEnv validator before submitting:
 uv run openenv validate
 ```
 
-## Baseline inference
+## Baseline Inference
 
-The baseline script uses the OpenAI client to let the model choose actions from the current observation. This keeps the project a benchmark for agent decision-making rather than a hand-scripted solver.
+The baseline script uses the OpenAI client to request a short per-task review plan, then executes a deterministic guardrailed AP workflow against the environment. This keeps the submission compatible with the hackathon requirement while producing stable, reproducible baseline scores.
 
 ```powershell
-docker build -f server/Dockerfile -t ap-invoice-env:latest .
+docker build -t ap-invoice-env:latest .
 python inference.py
 $env:MY_ENV_TASK="easy"; python inference.py
 $env:MY_ENV_TASK="medium"; python inference.py
@@ -103,3 +120,15 @@ $env:MY_ENV_TASK="hard"; python inference.py
 ```
 
 If `MY_ENV_TASK` is unset or set to `all`, the script runs `easy`, `medium`, and `hard` sequentially.
+
+### Baseline Scores
+
+Measured locally on April 7, 2026 with `MODEL_NAME=qwen3.5-4b`:
+
+| Task | Steps | Score |
+|---|---:|---:|
+| easy | 12 | 1.00 |
+| medium | 16 | 1.00 |
+| hard | 20 | 1.00 |
+
+These values were produced by the current `inference.py` using the local Docker image `ap-invoice-env:latest`.

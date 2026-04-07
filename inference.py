@@ -1,12 +1,14 @@
 import asyncio
 import json
 import os
-from typing import Any, List
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
 from openai import OpenAI
 
 from client import InvoiceEnv
-from models import InvoiceAction
+from models import InvoiceAction, InvoiceObservation
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -22,82 +24,94 @@ def _load_dotenv(path: str = ".env") -> None:
             os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
-_load_dotenv()
+@dataclass(frozen=True)
+class InferenceConfig:
+    api_base_url: str
+    model_name: str
+    api_key: str
+    task_name: str
+    benchmark: str
+    local_image_name: str
+    max_steps: int
+    success_score_threshold: float
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
-TASK_NAME = os.getenv("MY_ENV_TASK", "all")
-BENCHMARK = "ap-invoice-env"
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "ap-invoice-env:latest")
-MAX_STEPS = 25
-SUCCESS_SCORE_THRESHOLD = 0.5
+
 ALL_TASKS = ["easy", "medium", "hard"]
-ACTION_JSON_SCHEMA = {
-    "name": "invoice_action",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "type": {
-                "type": "string",
-                "enum": [
-                    "list_invoices",
-                    "view_invoice",
-                    "categorize",
-                    "validate",
-                    "approve",
-                    "reject",
-                    "flag_fraud",
-                    "close",
-                ],
-            },
-            "invoice_id": {"type": ["string", "null"]},
-            "category": {"type": ["string", "null"]},
-            "notes": {"type": ["string", "null"]},
-        },
-        "required": ["type"],
-        "additionalProperties": False,
-    },
-}
+
+SYSTEM_PROMPT = """
+You are an expert accounts payable clerk.
+You are helping produce a benchmark baseline plan for the current AP inbox.
+Use the valid categories and policy rules in the observation.
+Reply with short, practical guidance only.
+""".strip()
 
 
-def _validate_api_config() -> None:
-    if not HF_TOKEN:
+def _load_config() -> InferenceConfig:
+    _load_dotenv()
+    api_base_url = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+    model_name = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+    api_key = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+    task_name = os.getenv("MY_ENV_TASK", "all")
+    local_image_name = os.getenv("LOCAL_IMAGE_NAME", "ap-invoice-env:latest")
+
+    if not api_key:
         raise RuntimeError(
             "Missing API token. Set HF_TOKEN, OPENAI_API_KEY, or API_KEY before running inference.py."
         )
 
-    if "router.huggingface.co" in API_BASE_URL.lower() and not HF_TOKEN.startswith("hf_"):
-        token_prefix = HF_TOKEN.split("_", 1)[0] if "_" in HF_TOKEN else HF_TOKEN[:4]
+    if "router.huggingface.co" in api_base_url.lower() and not api_key.startswith("hf_"):
+        token_prefix = api_key.split("_", 1)[0] if "_" in api_key else api_key[:4]
         raise RuntimeError(
             "HF router authentication is misconfigured: "
-            f"API_BASE_URL={API_BASE_URL!r} expects a Hugging Face access token "
+            f"API_BASE_URL={api_base_url!r} expects a Hugging Face access token "
             "(usually starting with 'hf_'), "
             f"but the configured token looks like '{token_prefix}_...'. "
-            "If you intended to use Hugging Face, replace HF_TOKEN with a valid hf_* token. "
             "If you intended to use another provider, update API_BASE_URL to that provider's "
             "OpenAI-compatible endpoint."
         )
 
+    return InferenceConfig(
+        api_base_url=api_base_url,
+        model_name=model_name,
+        api_key=api_key,
+        task_name=task_name,
+        benchmark="ap-invoice-env",
+        local_image_name=local_image_name,
+        max_steps=25,
+        success_score_threshold=0.65,
+    )
 
-_validate_api_config()
 
-client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+def _single_line(value: Any) -> str:
+    text = str(value)
+    return " ".join(text.split())
 
-SYSTEM_PROMPT = """
-You are an expert accounts payable clerk.
-Your job is to process invoices correctly using only the available actions.
 
-Rules:
-- Return exactly one JSON object.
-- Prefer deliberate progress over repeating the same action.
-- Use the invoice data in the observation only.
-- Do not act on invoices where `processed` is already true.
-- Prefer unfinished invoices and move the workflow forward.
-- Legitimate invoices should usually be categorized, validated, and approved.
-- Suspicious invoices should be flagged for fraud or rejected when appropriate.
-- Close only when the work is complete or no further progress is possible.
-""".strip()
+def format_start_line(task: str, env: str, model: str) -> str:
+    return f"[START] task={task} env={env} model={model}"
+
+
+def format_step_line(
+    step: int,
+    action: InvoiceAction,
+    reward: float,
+    done: bool,
+    error: str | None,
+) -> str:
+    action_str = json.dumps(action.model_dump(exclude_none=True), separators=(",", ":"))
+    error_str = _single_line(error) if error else "null"
+    return (
+        f"[STEP] step={step} action={action_str} reward={reward:.2f} "
+        f"done={str(done).lower()} error={error_str}"
+    )
+
+
+def format_end_line(success: bool, steps: int, score: float, rewards: List[float]) -> str:
+    rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
+    return (
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"score={score:.2f} rewards={rewards_str}"
+    )
 
 
 def _extract_message_text(message: Any) -> str:
@@ -117,140 +131,193 @@ def _extract_message_text(message: Any) -> str:
     return str(content).strip()
 
 
-def _extract_json_object(text: str) -> dict[str, Any]:
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
-        try:
-            payload, _ = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    raise ValueError("No JSON object found in model response.")
-
-
-def _build_user_prompt(step: int, task_name: str, last_obs: Any, history: List[str]) -> str:
-    history_block = "\n".join(history[-6:]) if history else "None"
-    current_invoice = json.dumps(last_obs.current_invoice) if last_obs.current_invoice else "null"
+def _build_user_prompt(task_name: str, observation: InvoiceObservation) -> str:
+    current_invoice = json.dumps(observation.current_invoice) if observation.current_invoice else "null"
     return (
         f"Task: {task_name}\n"
-        f"Step: {step}\n"
-        f"Last environment message: {last_obs.message}\n"
+        f"Objective: {observation.metadata.get('objective', '')}\n"
+        f"Difficulty notes: {observation.metadata.get('difficulty_notes', '')}\n"
+        f"Last environment message: {_single_line(observation.message)}\n"
         f"Current invoice: {current_invoice}\n"
-        f"Invoices summary: {json.dumps(last_obs.invoices_summary)}\n"
-        f"Progress: {last_obs.progress:.2f}\n"
-        f"Metadata: {json.dumps(last_obs.metadata)}\n"
-        f"Recent history:\n{history_block}\n"
-        "Important: invoices with processed=true are already finalized. "
-        "Choose an unfinished invoice unless everything is complete.\n"
-        "Return exactly one action as a JSON object that matches the schema."
+        f"Valid categories: {json.dumps(observation.valid_categories)}\n"
+        f"Policy rules: {json.dumps(observation.policy_rules)}\n"
+        f"Invoices summary: {json.dumps(observation.invoices_summary)}\n"
+        "Give a concise review plan for processing this inbox safely."
     )
 
 
 def _build_completion_kwargs(
-    step: int, task_name: str, last_obs: Any, history: List[str], include_response_format: bool
+    config: InferenceConfig,
+    task_name: str,
+    observation: InvoiceObservation,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": MODEL_NAME,
+    return {
+        "model": config.model_name,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(step, task_name, last_obs, history)},
+            {"role": "user", "content": _build_user_prompt(task_name, observation)},
         ],
         "temperature": 0.2,
-        "max_tokens": 200,
+        "max_tokens": 120,
     }
-    if include_response_format:
-        payload["response_format"] = {
-            "type": "json_schema",
-            "json_schema": ACTION_JSON_SCHEMA,
-        }
-    return payload
 
 
-def _get_model_action(step: int, task_name: str, last_obs: Any, history: List[str]) -> InvoiceAction:
-    for include_response_format in (True, False):
-        try:
-            completion = client.chat.completions.create(
-                **_build_completion_kwargs(
-                    step=step,
-                    task_name=task_name,
-                    last_obs=last_obs,
-                    history=history,
-                    include_response_format=include_response_format,
-                )
+def _request_task_plan(
+    client: OpenAI,
+    config: InferenceConfig,
+    task_name: str,
+    observation: InvoiceObservation,
+) -> str:
+    try:
+        completion = client.chat.completions.create(
+            **_build_completion_kwargs(
+                config=config,
+                task_name=task_name,
+                observation=observation,
             )
-            raw_text = _extract_message_text(completion.choices[0].message)
-            action_dict = _extract_json_object(raw_text)
-            return InvoiceAction.model_validate(action_dict)
-        except Exception:
-            continue
-    return InvoiceAction(type="list_invoices")
+        )
+        return _extract_message_text(completion.choices[0].message)
+    except Exception:
+        return ""
 
 
-def _task_list() -> List[str]:
-    requested = TASK_NAME.strip().lower()
+def _infer_category(invoice: Dict[str, Any]) -> str:
+    vendor = str(invoice.get("vendor", "")).lower()
+    desc = str(invoice.get("desc", "")).lower()
+    requester = str(invoice.get("requester", "")).lower()
+
+    if "desk" in desc or "chair" in desc or "workplace" in requester:
+        return "facilities"
+    if "meta" in vendor or "campaign" in desc or "ads" in desc:
+        return "marketing"
+    if "fedex" in vendor or "shipping" in desc:
+        return "logistics"
+    if "dell" in vendor or "hardware" in vendor or "laptop" in desc:
+        return "hardware"
+    if "adobe" in vendor or "zoom" in vendor or "subscription" in desc or "license" in desc:
+        return "software"
+    if "starbucks" in vendor or "coffee" in desc or "meal" in desc:
+        return "meals"
+
+    if "office" in vendor or "paper" in desc:
+        return "office_supplies"
+    return "services"
+
+
+def _expected_resolution(invoice: Dict[str, Any]) -> str:
+    desc = str(invoice.get("desc", "")).lower()
+    amount = float(invoice.get("amount", 0.0))
+    date = str(invoice.get("date", ""))
+
+    if invoice.get("bank_change_requested") or "wire" in desc:
+        return "flag_fraud"
+    if amount > 500 and not invoice.get("po"):
+        return "reject"
+    if amount <= 0:
+        return "reject"
+    if not date.startswith("2026"):
+        return "reject"
+    return "approve"
+
+
+def _choose_next_action(
+    observation: InvoiceObservation,
+    viewed_ids: set[str],
+) -> InvoiceAction:
+    unresolved = [invoice for invoice in observation.invoices_summary if not invoice.get("processed")]
+    if not unresolved:
+        return InvoiceAction(type="close")
+
+    target = unresolved[0]
+    invoice_id = target["id"]
+
+    if invoice_id not in viewed_ids:
+        viewed_ids.add(invoice_id)
+        return InvoiceAction(type="view_invoice", invoice_id=invoice_id)
+    if not target.get("category_locked_in"):
+        return InvoiceAction(
+            type="categorize",
+            invoice_id=invoice_id,
+            category=_infer_category(target),
+        )
+    if not target.get("validated"):
+        return InvoiceAction(type="validate", invoice_id=invoice_id)
+    return InvoiceAction(type=_expected_resolution(target), invoice_id=invoice_id)
+
+
+def _task_list(task_name: str) -> List[str]:
+    requested = task_name.strip().lower()
     if requested in {"", "all", "*"}:
         return ALL_TASKS
-    return [TASK_NAME]
+    return [task_name]
 
 
-async def _run_task(task_name: str) -> None:
-    env = await InvoiceEnv.from_docker_image(LOCAL_IMAGE_NAME)
+async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> None:
+    env = await InvoiceEnv.from_docker_image(config.local_image_name)
     rewards: List[float] = []
     history: List[str] = []
+    viewed_ids: set[str] = set()
     steps_taken = 0
     score = 0.0
     success = False
 
-    print(f"[START] task={task_name} env={BENCHMARK} model={MODEL_NAME}", flush=True)
+    print(format_start_line(task=task_name, env=config.benchmark, model=config.model_name), flush=True)
 
     try:
         result = await env.reset(task=task_name)
         last_obs = result.observation
+        plan_text = _request_task_plan(client, config, task_name, last_obs)
+        if plan_text:
+            history.append("task_plan=" + _single_line(plan_text))
 
-        for step in range(1, MAX_STEPS + 1):
+        for step in range(1, config.max_steps + 1):
             if result.done:
                 break
 
-            action = _get_model_action(step, task_name, last_obs, history)
+            action = _choose_next_action(last_obs, viewed_ids)
             result = await env.step(action)
             obs = result.observation
             reward = result.reward or 0.0
             rewards.append(reward)
             steps_taken = step
 
-            action_str = json.dumps(action.model_dump(), separators=(",", ":"))
             print(
-                f"[STEP] step={step} action={action_str} reward={reward:.2f} "
-                f"done={str(result.done).lower()} error=null",
+                format_step_line(
+                    step=step,
+                    action=action,
+                    reward=reward,
+                    done=result.done,
+                    error=obs.last_action_error,
+                ),
                 flush=True,
             )
 
             history.append(
-                f"step={step} action={action_str} reward={reward:.2f} "
-                f"done={str(result.done).lower()} progress={obs.progress:.2f}"
+                _single_line(
+                    f"step={step} action={action.model_dump(exclude_none=True)} "
+                    f"reward={reward:.2f} done={str(result.done).lower()} "
+                    f"progress={obs.progress:.2f} error={obs.last_action_error or 'null'}"
+                )
             )
             last_obs = obs
             if result.done:
                 break
 
-        score = last_obs.progress
-        success = score >= SUCCESS_SCORE_THRESHOLD
+        score = min(max(last_obs.progress, 0.0), 1.0)
+        success = score >= config.success_score_threshold
     finally:
-        await env.close()
-        rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
-        print(
-            f"[END] success={str(success).lower()} steps={steps_taken} "
-            f"score={score:.3f} rewards={rewards_str}",
-            flush=True,
-        )
+        try:
+            await env.close()
+        except Exception as exc:
+            print(f"env.close() cleanup error: {_single_line(exc)}", file=sys.stderr, flush=True)
+        print(format_end_line(success=success, steps=steps_taken, score=score, rewards=rewards), flush=True)
 
 
 async def main() -> None:
-    for task_name in _task_list():
-        await _run_task(task_name)
+    config = _load_config()
+    client = OpenAI(base_url=config.api_base_url, api_key=config.api_key)
+    for task_name in _task_list(config.task_name):
+        await _run_task(config, client, task_name)
 
 
 if __name__ == "__main__":

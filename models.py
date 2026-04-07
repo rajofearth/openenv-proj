@@ -23,7 +23,10 @@ class InvoiceObservation(BaseModel):
     message: str
     invoices_summary: List[Dict[str, Any]] = Field(default_factory=list)
     current_invoice: Optional[Dict[str, Any]] = None
+    valid_categories: List[str] = Field(default_factory=list)
+    policy_rules: List[str] = Field(default_factory=list)
     reward: float = 0.0
     done: bool = False
     progress: float = 0.0
+    last_action_error: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
