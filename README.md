@@ -97,6 +97,8 @@ Copy-Item .env.example .env
 
 `inference.py` auto-loads values from `.env` if that file exists.
 
+If the evaluator launches `python inference.py` in a partially prepared environment, the script can self-bootstrap missing runtime dependencies from the root [`requirements.txt`](P:/Projects/openenv-proj/requirements.txt) before continuing. Normal local setup commands remain unchanged.
+
 ## Docker
 
 Validator-compatible root build:
@@ -129,6 +131,14 @@ python inference.py # to run all of the tasks
 $env:MY_ENV_TASK="easy"; python inference.py
 $env:MY_ENV_TASK="medium"; python inference.py
 $env:MY_ENV_TASK="hard"; python inference.py
+```
+
+For a clean-machine reproduction of the evaluator path:
+
+```powershell
+python -m venv .validator-venv
+.\.validator-venv\Scripts\python -m pip install -r requirements.txt
+.\.validator-venv\Scripts\python inference.py
 ```
 
 If `MY_ENV_TASK` is unset or set to `all`, the script runs `easy`, `medium`, and `hard` sequentially.

@@ -1,11 +1,95 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
+import io
 import json
 import os
+import site
+import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
+
+
+RUNTIME_DEPENDENCIES = ("pydantic", "openai", "websockets", "openenv")
+_BOOTSTRAP_ATTEMPTED = False
+
+
+def _missing_runtime_dependencies() -> list[str]:
+    missing: list[str] = []
+    for module_name in RUNTIME_DEPENDENCIES:
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(module_name)
+    return missing
+
+
+def _ensure_runtime_dependencies() -> None:
+    global _BOOTSTRAP_ATTEMPTED
+
+    missing = _missing_runtime_dependencies()
+    if not missing:
+        return
+    if _BOOTSTRAP_ATTEMPTED:
+        raise RuntimeError(
+            "Missing runtime dependencies after bootstrap attempt: "
+            + ", ".join(missing)
+        )
+
+    requirements_path = Path(__file__).resolve().with_name("requirements.txt")
+    if not requirements_path.exists():
+        raise RuntimeError(
+            "Missing runtime dependencies: "
+            + ", ".join(missing)
+            + f". Bootstrap requires {requirements_path} to exist."
+        )
+
+    _BOOTSTRAP_ATTEMPTED = True
+    install_command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        str(requirements_path),
+    ]
+
+    try:
+        subprocess.run(
+            install_command,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Bootstrap dependency install failed for missing packages "
+            + ", ".join(missing)
+            + ". Command: "
+            + " ".join(install_command)
+        ) from exc
+
+    for site_packages_dir in site.getsitepackages():
+        site.addsitedir(site_packages_dir)
+    user_site_packages = site.getusersitepackages()
+    if user_site_packages:
+        site.addsitedir(user_site_packages)
+
+    importlib.invalidate_caches()
+
+    remaining = _missing_runtime_dependencies()
+    if remaining:
+        raise RuntimeError(
+            "Runtime dependencies still missing after bootstrap: "
+            + ", ".join(remaining)
+            + ". Command: "
+            + " ".join(install_command)
+        )
+
+
+_ensure_runtime_dependencies()
 
 from models import InvoiceAction, InvoiceObservation
 
@@ -383,7 +467,10 @@ async def _run_task(config: InferenceConfig, client: Any, task_name: str) -> Non
         score = min(max(observation.progress, 0.0), 1.0)
         success = score >= config.success_score_threshold
     finally:
-        await env.close()
+        try:
+            await env.close()
+        except Exception:
+            pass
         print(
             format_end_line(
                 success=success, steps=steps_taken, score=score, rewards=rewards
@@ -504,4 +591,19 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    original_stdout = sys.stdout
+    stdout_buffer = io.StringIO()
+    sys.stdout = stdout_buffer
+    exit_code = 0
+    try:
+        asyncio.run(main())
+    except Exception:
+        exit_code = 1
+    finally:
+        sys.stdout = original_stdout
+
+    for line in stdout_buffer.getvalue().splitlines():
+        if line.startswith(("[START]", "[STEP]", "[END]")):
+            print(line, flush=True)
+
+    raise SystemExit(exit_code)
