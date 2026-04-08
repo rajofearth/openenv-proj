@@ -1,15 +1,17 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, List
+from typing import TYPE_CHECKING, Any, List
 
-from openai import OpenAI
-from websockets import exceptions as websocket_exceptions
-
-from client import InvoiceEnv
 from models import InvoiceAction, InvoiceObservation
+
+if TYPE_CHECKING:
+    from openai import OpenAI
+    from client import InvoiceEnv
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -273,7 +275,7 @@ def _fallback_action(observation: InvoiceObservation) -> InvoiceAction:
 
 
 def _get_model_action(
-    client: OpenAI,
+    client: Any,
     config: InferenceConfig,
     step: int,
     task_name: str,
@@ -310,7 +312,7 @@ def _task_list(task_name: str) -> List[str]:
     return [task_name]
 
 
-async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> None:
+async def _run_task(config: InferenceConfig, client: Any, task_name: str) -> None:
     env = await _open_env(config)
     rewards: List[float] = []
     history: List[str] = []
@@ -391,6 +393,8 @@ async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> 
 
 
 async def _open_env(config: InferenceConfig) -> InvoiceEnv:
+    from client import InvoiceEnv
+
     return await InvoiceEnv.from_docker_image_with_timeouts(
         config.local_image_name,
         connect_timeout_s=config.env_connect_timeout_s,
@@ -450,6 +454,14 @@ async def _step_with_recovery(
 
 
 def _is_transient_env_error(exc: Exception) -> bool:
+    websocket_error_types: tuple[type[BaseException], ...] = ()
+    try:
+        from websockets import exceptions as websocket_exceptions
+
+        websocket_error_types = (websocket_exceptions.WebSocketException,)
+    except Exception:
+        pass
+
     return isinstance(
         exc,
         (
@@ -457,13 +469,13 @@ def _is_transient_env_error(exc: Exception) -> bool:
             ConnectionError,
             ConnectionAbortedError,
             OSError,
-            websocket_exceptions.WebSocketException,
+            *websocket_error_types,
         ),
     )
 
 
 async def _run_task_with_retries(
-    config: InferenceConfig, client: OpenAI, task_name: str
+    config: InferenceConfig, client: Any, task_name: str
 ) -> None:
     attempts = max(1, config.task_retries + 1)
     for attempt in range(1, attempts + 1):
@@ -483,6 +495,8 @@ async def _run_task_with_retries(
 
 
 async def main() -> None:
+    from openai import OpenAI
+
     config = _load_config()
     client = OpenAI(base_url=config.api_base_url, api_key=config.api_key)
     for task_name in _task_list(config.task_name):

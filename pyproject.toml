@@ -13,16 +13,18 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "pydantic>=2.9.0",
     "openenv-core>=0.2.1",
+    "openai>=1.35.0",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
-dev = ["openai>=1.35.0"]
+dev = []
 
 [project.scripts]
 server = "server.app:main"
 
 [dependency-groups]
-dev = ["openai>=1.35.0"]
+dev = []
 
 [tool.setuptools]
 py-modules = ["client", "inference", "models"]

@@ -5,7 +5,7 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY . .
 
-RUN uv venv && uv pip install -e .[dev]
+RUN uv venv && uv pip install -e .
 
 EXPOSE 8000
 
