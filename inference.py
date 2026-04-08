@@ -280,7 +280,12 @@ def _task_list(task_name: str) -> List[str]:
 
 
 async def _run_task(config: InferenceConfig, client: OpenAI, task_name: str) -> None:
-    env = await InvoiceEnv.from_docker_image(config.local_image_name)
+    local_env_url = os.getenv("LOCAL_ENV_URL")
+    if local_env_url:
+        env = InvoiceEnv(base_url=local_env_url)
+    else:
+        env = await InvoiceEnv.from_docker_image(config.local_image_name)
+    
     rewards: List[float] = []
     history: List[str] = []
     steps_taken = 0
