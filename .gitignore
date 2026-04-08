@@ -10,7 +10,7 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
-
+.validator-venv/
 .env
 .env.*
 
