@@ -97,7 +97,7 @@ Copy-Item .env.example .env
 
 `inference.py` auto-loads values from `.env` if that file exists.
 
-If the evaluator launches `python inference.py` in a partially prepared environment, the script can self-bootstrap missing runtime dependencies from the root [`requirements.txt`](P:/Projects/openenv-proj/requirements.txt) before continuing. Normal local setup commands remain unchanged.
+If the evaluator launches `python inference.py` in a partially prepared environment, the script can self-bootstrap missing runtime dependencies from the root [`requirements.txt`](P:/Projects/openenv-proj/requirements.txt) before continuing. It prefers the Docker image named by `LOCAL_IMAGE_NAME`, but falls back to the in-process environment implementation if evaluator-side Docker/image wiring is unavailable so the baseline still completes with structured logs.
 
 ## Docker
 
@@ -127,7 +127,7 @@ The baseline script uses the OpenAI client to request a short per-task review pl
 
 ```powershell
 docker build -t ap-invoice-env:latest .
-python inference.py # to run all of the tasks
+uv run python inference.py # to run all of the tasks
 $env:MY_ENV_TASK="easy"; python inference.py
 $env:MY_ENV_TASK="medium"; python inference.py
 $env:MY_ENV_TASK="hard"; python inference.py
