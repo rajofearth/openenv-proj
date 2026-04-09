@@ -28,6 +28,22 @@ class InferenceFormattingTests(unittest.TestCase):
         self.assertIn("error=Episode closed early with 2 invoices still unresolved.", line)
         self.assertNotIn("error=null", line)
 
+    def test_end_line_caps_boundary_score_below_one(self) -> None:
+        line = format_end_line(success=True, steps=3, score=1.0, rewards=[0.1, 0.2, 0.3])
+
+        self.assertEqual(
+            line,
+            "[END] success=true steps=3 score=0.99 rewards=0.10,0.20,0.30",
+        )
+
+    def test_end_line_raises_boundary_score_above_zero(self) -> None:
+        line = format_end_line(success=False, steps=0, score=0.0, rewards=[])
+
+        self.assertEqual(
+            line,
+            "[END] success=false steps=0 score=0.01 rewards=",
+        )
+
 
 class InferenceResilienceTests(unittest.IsolatedAsyncioTestCase):
     async def test_task_failure_still_emits_structured_start_and_end(self) -> None:
@@ -60,7 +76,7 @@ class InferenceResilienceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             lines[-1],
-            "[END] success=false steps=0 score=0.00 rewards=",
+            "[END] success=false steps=0 score=0.01 rewards=",
         )
 
 

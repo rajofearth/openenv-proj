@@ -224,6 +224,7 @@ def format_step_line(
 def format_end_line(
     success: bool, steps: int, score: float, rewards: List[float]
 ) -> str:
+    score = _reported_score(score)
     rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
     return (
         f"[END] success={str(success).lower()} steps={steps} "
@@ -237,6 +238,11 @@ def _format_action(action: InvoiceAction) -> str:
     if action.invoice_id:
         return f"{action.type}({action.invoice_id})"
     return action.type
+
+
+def _reported_score(score: float) -> float:
+    # The evaluator rejects boundary values, so keep the emitted score strictly inside (0, 1).
+    return min(max(score, 0.01), 0.99)
 
 
 def _extract_message_text(message: Any) -> str:
@@ -574,7 +580,7 @@ async def _run_task(
             if result.done:
                 break
 
-        score = min(max(observation.progress, 0.0), 1.0)
+        score = _reported_score(min(max(observation.progress, 0.0), 1.0))
         success = score >= config.success_score_threshold
     finally:
         try:
