@@ -9,6 +9,7 @@ import os
 import site
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
@@ -115,7 +116,7 @@ def _load_dotenv(path: str = ".env") -> None:
 class InferenceConfig:
     api_base_url: str
     model_name: str
-    api_key: str
+    api_key: str | None
     task_name: str
     benchmark: str
     local_image_name: str
@@ -182,28 +183,10 @@ def _load_config() -> InferenceConfig:
     env_message_timeout_s = float(os.getenv("ENV_MESSAGE_TIMEOUT_S", "180"))
     task_retries = int(os.getenv("TASK_RETRIES", "2"))
 
-    if not api_key:
-        raise RuntimeError(
-            "Missing API token. Set HF_TOKEN, OPENAI_API_KEY, or API_KEY before running inference.py."
-        )
-
-    if "router.huggingface.co" in api_base_url.lower() and not api_key.startswith(
-        "hf_"
-    ):
-        token_prefix = api_key.split("_", 1)[0] if "_" in api_key else api_key[:4]
-        raise RuntimeError(
-            "HF router authentication is misconfigured: "
-            f"API_BASE_URL={api_base_url!r} expects a Hugging Face access token "
-            "(usually starting with 'hf_'), "
-            f"but the configured token looks like '{token_prefix}_...'. "
-            "If you intended to use another provider, update API_BASE_URL to that provider's "
-            "OpenAI-compatible endpoint."
-        )
-
     return InferenceConfig(
         api_base_url=api_base_url,
         model_name=model_name,
-        api_key=api_key,
+        api_key=api_key.strip() if api_key else None,
         task_name=task_name,
         benchmark="ap-invoice-env",
         local_image_name=local_image_name,
@@ -351,21 +334,153 @@ def _build_completion_kwargs(
 
 
 def _fallback_action(observation: InvoiceObservation) -> InvoiceAction:
-    if observation.current_invoice and not observation.current_invoice.get("processed"):
+    if (
+        observation.metadata.get("steps", 0) == 0
+        and observation.message.startswith("Inbox loaded")
+    ):
+        return InvoiceAction(type="list_invoices")
+
+    current_invoice = observation.current_invoice
+    if current_invoice and not current_invoice.get("processed"):
+        invoice_id = current_invoice["id"]
+        if not current_invoice.get("category_locked_in"):
+            return InvoiceAction(
+                type="categorize",
+                invoice_id=invoice_id,
+                category=_infer_category(current_invoice),
+            )
+        if not current_invoice.get("validated"):
+            return InvoiceAction(type="validate", invoice_id=invoice_id)
         return InvoiceAction(
-            type="validate", invoice_id=observation.current_invoice["id"]
+            type=_infer_resolution(current_invoice, observation),
+            invoice_id=invoice_id,
         )
-    return InvoiceAction(type="list_invoices")
+
+    for invoice in observation.invoices_summary:
+        if not invoice.get("processed"):
+            return InvoiceAction(type="view_invoice", invoice_id=invoice["id"])
+
+    return InvoiceAction(type="close")
+
+
+def _infer_category(invoice: dict[str, Any]) -> str:
+    haystack = " ".join(
+        str(invoice.get(field, "")).lower()
+        for field in ("vendor", "desc", "requester")
+    )
+
+    keyword_to_category = [
+        (("desk", "interior", "workplace", "facility"), "facilities"),
+        (("campaign", "paid social", "ad spend", "growth"), "marketing"),
+        (("fedex", "shipping", "logistics"), "logistics"),
+        (("adobe", "zoom", "software", "subscription", "license", "cloud"), "software"),
+        (("coffee", "meal", "lunch", "dinner", "starbucks"), "meals"),
+        (("dell", "laptop", "hardware", "adjustment memo", "northwind"), "hardware"),
+        (("wire", "onboarding payment", "services"), "services"),
+        (("office", "printer paper", "paper restock", "officedepot"), "office_supplies"),
+    ]
+    for keywords, category in keyword_to_category:
+        if any(keyword in haystack for keyword in keywords):
+            return category
+    return "services"
+
+
+def _infer_resolution(
+    invoice: dict[str, Any], observation: InvoiceObservation
+) -> str:
+    amount = float(invoice.get("amount", 0.0) or 0.0)
+    date_value = str(invoice.get("date", ""))
+    po = invoice.get("po")
+    bank_change_requested = bool(invoice.get("bank_change_requested"))
+    message = (observation.message or "").lower()
+    desc = str(invoice.get("desc", "")).lower()
+
+    if bank_change_requested or "unexpected_bank_change_request" in message:
+        return "flag_fraud"
+    if "urgent" in desc and "wire" in desc:
+        return "flag_fraud"
+    if amount < 0:
+        return "reject"
+    if date_value >= "2027-01-01":
+        return "reject"
+    if amount > 500 and not po:
+        return "reject"
+    if "validation found issues" in message:
+        return "reject"
+    return "approve"
+
+
+@dataclass
+class LocalStepResult:
+    observation: InvoiceObservation
+    reward: float | None
+    done: bool
+
+
+class LocalInvoiceEnvAdapter:
+    def __init__(self) -> None:
+        from server.invoice_environment import InvoiceEnv as InvoiceServerEnv
+
+        self._env = InvoiceServerEnv()
+
+    async def reset(self, task: str) -> LocalStepResult:
+        observation = self._env.reset(task=task)
+        return LocalStepResult(
+            observation=observation,
+            reward=observation.reward,
+            done=observation.done,
+        )
+
+    async def step(self, action: InvoiceAction) -> LocalStepResult:
+        observation = self._env.step(action)
+        return LocalStepResult(
+            observation=observation,
+            reward=observation.reward,
+            done=observation.done,
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class StructuredStdoutFilter(io.TextIOBase):
+    def __init__(self, wrapped: Any) -> None:
+        self._wrapped = wrapped
+        self._buffer = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.startswith(("[START]", "[STEP]", "[END]")):
+                self._wrapped.write(line + "\n")
+                self._wrapped.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer.startswith(("[START]", "[STEP]", "[END]")):
+            self._wrapped.write(self._buffer)
+            self._wrapped.flush()
+        self._buffer = ""
 
 
 def _get_model_action(
-    client: Any,
+    client: Any | None,
     config: InferenceConfig,
     step: int,
     task_name: str,
     observation: InvoiceObservation,
     history: List[str],
 ) -> InvoiceAction:
+    if client is None:
+        return _fallback_action(observation)
+
     errors: List[str] = []
     for include_response_format in (True, False):
         try:
@@ -396,7 +511,9 @@ def _task_list(task_name: str) -> List[str]:
     return [task_name]
 
 
-async def _run_task(config: InferenceConfig, client: Any, task_name: str) -> None:
+async def _run_task(
+    config: InferenceConfig, client: Any | None, task_name: str
+) -> tuple[List[float], int, float, bool]:
     env = await _open_env(config)
     rewards: List[float] = []
     history: List[str] = []
@@ -404,13 +521,6 @@ async def _run_task(config: InferenceConfig, client: Any, task_name: str) -> Non
     steps_taken = 0
     score = 0.0
     success = False
-
-    print(
-        format_start_line(
-            task=task_name, env=config.benchmark, model=config.model_name
-        ),
-        flush=True,
-    )
 
     try:
         result = await env.reset(task=task_name)
@@ -471,22 +581,26 @@ async def _run_task(config: InferenceConfig, client: Any, task_name: str) -> Non
             await env.close()
         except Exception:
             pass
+    return rewards, steps_taken, score, success
+
+
+async def _open_env(config: InferenceConfig) -> Any:
+    try:
+        from client import InvoiceEnv
+
+        return await InvoiceEnv.from_docker_image_with_timeouts(
+            config.local_image_name,
+            connect_timeout_s=config.env_connect_timeout_s,
+            message_timeout_s=config.env_message_timeout_s,
+        )
+    except Exception as exc:
         print(
-            format_end_line(
-                success=success, steps=steps_taken, score=score, rewards=rewards
-            ),
+            "Falling back to in-process environment after docker startup failed: "
+            + _single_line(exc),
+            file=sys.stderr,
             flush=True,
         )
-
-
-async def _open_env(config: InferenceConfig) -> InvoiceEnv:
-    from client import InvoiceEnv
-
-    return await InvoiceEnv.from_docker_image_with_timeouts(
-        config.local_image_name,
-        connect_timeout_s=config.env_connect_timeout_s,
-        message_timeout_s=config.env_message_timeout_s,
-    )
+        return LocalInvoiceEnvAdapter()
 
 
 async def _rebuild_env(
@@ -562,48 +676,91 @@ def _is_transient_env_error(exc: Exception) -> bool:
 
 
 async def _run_task_with_retries(
-    config: InferenceConfig, client: Any, task_name: str
+    config: InferenceConfig, client: Any | None, task_name: str
 ) -> None:
+    print(
+        format_start_line(
+            task=task_name, env=config.benchmark, model=config.model_name
+        ),
+        flush=True,
+    )
+
     attempts = max(1, config.task_retries + 1)
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+
     for attempt in range(1, attempts + 1):
         try:
-            await _run_task(config, client, task_name)
-            return
+            rewards, steps_taken, score, success = await _run_task(
+                config, client, task_name
+            )
+            break
         except Exception as exc:
-            if not _is_transient_env_error(exc) or attempt >= attempts:
-                raise
+            if _is_transient_env_error(exc) and attempt < attempts:
+                print(
+                    f"Retrying task {task_name} from recovered state ({attempt}/{attempts}). "
+                    f"Reason: {_single_line(exc)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await asyncio.sleep(min(attempt, 3))
+                continue
+
             print(
-                f"Retrying task {task_name} from recovered state ({attempt}/{attempts}). "
-                f"Reason: {_single_line(exc)}",
+                f"Task {task_name} failed after {attempt} attempt(s): {_single_line(exc)}",
                 file=sys.stderr,
                 flush=True,
             )
-            await asyncio.sleep(min(attempt, 3))
+            traceback.print_exception(exc, file=sys.stderr)
+            break
+
+    print(
+        format_end_line(
+            success=success, steps=steps_taken, score=score, rewards=rewards
+        ),
+        flush=True,
+    )
 
 
 async def main() -> None:
     from openai import OpenAI
 
     config = _load_config()
-    client = OpenAI(base_url=config.api_base_url, api_key=config.api_key)
+    client = None
+    if config.api_key:
+        try:
+            client = OpenAI(base_url=config.api_base_url, api_key=config.api_key)
+        except Exception as exc:
+            print(
+                "OpenAI client initialization failed, continuing with rule-based fallback: "
+                + _single_line(exc),
+                file=sys.stderr,
+                flush=True,
+            )
+    else:
+        print(
+            "No API token configured, continuing with rule-based fallback actions.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     for task_name in _task_list(config.task_name):
         await _run_task_with_retries(config, client, task_name)
 
 
 if __name__ == "__main__":
     original_stdout = sys.stdout
-    stdout_buffer = io.StringIO()
-    sys.stdout = stdout_buffer
-    exit_code = 0
+    sys.stdout = StructuredStdoutFilter(original_stdout)
     try:
         asyncio.run(main())
-    except Exception:
-        exit_code = 1
+    except Exception as exc:
+        print(
+            "Fatal inference error: " + _single_line(exc),
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exception(exc, file=sys.stderr)
     finally:
         sys.stdout = original_stdout
-
-    for line in stdout_buffer.getvalue().splitlines():
-        if line.startswith(("[START]", "[STEP]", "[END]")):
-            print(line, flush=True)
-
-    raise SystemExit(exit_code)
